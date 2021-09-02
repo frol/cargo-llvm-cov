@@ -6,7 +6,13 @@ use std::{env, path::PathBuf};
 use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 
-use crate::{config::Config, context::Context, env::Env, process::ProcessBuilder};
+use crate::{
+    cli::{Args, BuildOptions, RunOptions},
+    config::Config,
+    context::Context,
+    env::Env,
+    process::ProcessBuilder,
+};
 
 pub(crate) struct Cargo {
     path: PathBuf,
@@ -149,167 +155,202 @@ fn metadata(env: &Env, manifest_path: &Utf8Path) -> Result<cargo_metadata::Metad
 }
 
 // https://doc.rust-lang.org/nightly/cargo/commands/cargo-test.html
-pub(crate) fn test_args(cx: &Context, cmd: &mut ProcessBuilder) {
+pub(crate) fn test_args(cx: &Context, args: &Args, cmd: &mut ProcessBuilder) {
     let mut has_target_selection_options = false;
-    if cx.args.lib {
+    if args.lib {
         has_target_selection_options = true;
         cmd.arg("--lib");
     }
-    for name in &cx.args.bin {
+    for name in &args.bin {
         has_target_selection_options = true;
         cmd.arg("--bin");
         cmd.arg(name);
     }
-    if cx.args.bins {
+    if args.bins {
         has_target_selection_options = true;
         cmd.arg("--bins");
     }
-    for name in &cx.args.example {
+    for name in &args.example {
         has_target_selection_options = true;
         cmd.arg("--example");
         cmd.arg(name);
     }
-    if cx.args.examples {
+    if args.examples {
         has_target_selection_options = true;
         cmd.arg("--examples");
     }
-    for name in &cx.args.test {
+    for name in &args.test {
         has_target_selection_options = true;
         cmd.arg("--test");
         cmd.arg(name);
     }
-    if cx.args.tests {
+    if args.tests {
         has_target_selection_options = true;
         cmd.arg("--tests");
     }
-    for name in &cx.args.bench {
+    for name in &args.bench {
         has_target_selection_options = true;
         cmd.arg("--bench");
         cmd.arg(name);
     }
-    if cx.args.benches {
+    if args.benches {
         has_target_selection_options = true;
         cmd.arg("--benches");
     }
-    if cx.args.all_targets {
+    if args.all_targets {
         has_target_selection_options = true;
         cmd.arg("--all-targets");
     }
-    if cx.args.doc {
+    if args.doc {
         has_target_selection_options = true;
         cmd.arg("--doc");
     }
 
-    if !has_target_selection_options && !cx.args.doctests {
+    if !has_target_selection_options && !cx.doctests {
         cmd.arg("--tests");
     }
 
-    if cx.args.quiet {
+    if args.quiet {
         cmd.arg("--quiet");
     }
-    if cx.args.no_fail_fast {
+    if args.no_fail_fast {
         cmd.arg("--no-fail-fast");
     }
-    for package in &cx.args.package {
+    for package in &args.package {
         cmd.arg("--package");
         cmd.arg(package);
     }
-    if cx.args.workspace {
+    if args.workspace {
         cmd.arg("--workspace");
     }
-    for exclude in &cx.args.exclude {
+    for exclude in &args.exclude {
         cmd.arg("--exclude");
         cmd.arg(exclude);
-    }
-    if let Some(jobs) = cx.args.jobs {
-        cmd.arg("--jobs");
-        cmd.arg(jobs.to_string());
-    }
-    if cx.args.release {
-        cmd.arg("--release");
-    }
-    if let Some(profile) = &cx.args.profile {
-        cmd.arg("--profile");
-        cmd.arg(profile);
-    }
-    for features in &cx.args.features {
-        cmd.arg("--features");
-        cmd.arg(features);
-    }
-    if cx.args.all_features {
-        cmd.arg("--all-features");
-    }
-    if cx.args.no_default_features {
-        cmd.arg("--no-default-features");
-    }
-    if let Some(target) = &cx.args.target {
-        cmd.arg("--target");
-        cmd.arg(target);
     }
 
     cmd.arg("--manifest-path");
     cmd.arg(&cx.ws.current_manifest);
 
-    if let Some(color) = cx.args.color {
+    build_args(&cx.build, cmd);
+
+    if !args.args.is_empty() {
+        cmd.arg("--");
+        cmd.args(&args.args);
+    }
+}
+
+// https://doc.rust-lang.org/nightly/cargo/commands/cargo-run.html
+pub(crate) fn run_args(cx: &Context, args: &RunOptions, cmd: &mut ProcessBuilder) {
+    for name in &args.bin {
+        cmd.arg("--bin");
+        cmd.arg(name);
+    }
+    for name in &args.example {
+        cmd.arg("--example");
+        cmd.arg(name);
+    }
+
+    if args.quiet {
+        cmd.arg("--quiet");
+    }
+    if let Some(package) = &args.package {
+        cmd.arg("--package");
+        cmd.arg(package);
+    }
+
+    cmd.arg("--manifest-path");
+    cmd.arg(&cx.ws.current_manifest);
+
+    build_args(&cx.build, cmd);
+
+    if !args.args.is_empty() {
+        cmd.arg("--");
+        cmd.args(&args.args);
+    }
+}
+
+pub(crate) fn build_args(options: &BuildOptions, cmd: &mut ProcessBuilder) {
+    if let Some(jobs) = options.jobs {
+        cmd.arg("--jobs");
+        cmd.arg(jobs.to_string());
+    }
+    if options.release {
+        cmd.arg("--release");
+    }
+    if let Some(profile) = &options.profile {
+        cmd.arg("--profile");
+        cmd.arg(profile);
+    }
+    for features in &options.features {
+        cmd.arg("--features");
+        cmd.arg(features);
+    }
+    if options.all_features {
+        cmd.arg("--all-features");
+    }
+    if options.no_default_features {
+        cmd.arg("--no-default-features");
+    }
+    if let Some(target) = &options.target {
+        cmd.arg("--target");
+        cmd.arg(target);
+    }
+
+    if let Some(color) = options.color {
         cmd.arg("--color");
         cmd.arg(color.cargo_color());
     }
-    if cx.args.frozen {
+    if options.frozen {
         cmd.arg("--frozen");
     }
-    if cx.args.locked {
+    if options.locked {
         cmd.arg("--locked");
     }
-    if cx.args.offline {
+    if options.offline {
         cmd.arg("--offline");
     }
 
-    if cx.args.verbose > 1 {
-        cmd.arg(format!("-{}", "v".repeat(cx.args.verbose as usize - 1)));
+    if options.verbose > 1 {
+        cmd.arg(format!("-{}", "v".repeat(options.verbose as usize - 1)));
     }
 
-    for unstable_flag in &cx.args.unstable_flags {
+    for unstable_flag in &options.unstable_flags {
         cmd.arg("-Z");
         cmd.arg(unstable_flag);
-    }
-
-    if !cx.args.args.is_empty() {
-        cmd.arg("--");
-        cmd.args(&cx.args.args);
     }
 }
 
 // https://doc.rust-lang.org/nightly/cargo/commands/cargo-clean.html
 pub(crate) fn clean_args(cx: &Context, cmd: &mut ProcessBuilder) {
-    if cx.args.quiet {
+    if cx.quiet {
         cmd.arg("--quiet");
     }
-    if cx.args.release {
+    if cx.build.release {
         cmd.arg("--release");
     }
-    if let Some(profile) = &cx.args.profile {
+    if let Some(profile) = &cx.build.profile {
         cmd.arg("--profile");
         cmd.arg(profile);
     }
-    if let Some(target) = &cx.args.target {
+    if let Some(target) = &cx.build.target {
         cmd.arg("--target");
         cmd.arg(target);
     }
-    if let Some(color) = cx.args.color {
+    if let Some(color) = cx.build.color {
         cmd.arg("--color");
         cmd.arg(color.cargo_color());
     }
-    if cx.args.frozen {
+    if cx.build.frozen {
         cmd.arg("--frozen");
     }
-    if cx.args.locked {
+    if cx.build.locked {
         cmd.arg("--locked");
     }
-    if cx.args.offline {
+    if cx.build.offline {
         cmd.arg("--offline");
     }
 
-    if cx.args.verbose > 1 {
-        cmd.arg(format!("-{}", "v".repeat(cx.args.verbose as usize - 1)));
+    if cx.build.verbose > 1 {
+        cmd.arg(format!("-{}", "v".repeat(cx.build.verbose as usize - 1)));
     }
 }

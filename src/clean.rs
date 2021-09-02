@@ -44,11 +44,11 @@ pub(crate) fn run(mut options: CleanOptions) -> Result<()> {
 // - doctest bins
 // - old reports
 pub(crate) fn clean_partial(cx: &Context) -> Result<()> {
-    if cx.args.no_run || cx.args.no_report {
+    if cx.no_run || cx.cov.no_report {
         return Ok(());
     }
 
-    clean_ws_inner(&cx.ws, &cx.workspace_members.included, cx.args.verbose > 1)?;
+    clean_ws_inner(&cx.ws, &cx.workspace_members.included, cx.build.verbose > 1)?;
 
     let package_args: Vec<_> = cx
         .workspace_members
@@ -59,7 +59,7 @@ pub(crate) fn clean_partial(cx: &Context) -> Result<()> {
     let mut cmd = cx.cargo_process();
     cmd.args(["clean", "--target-dir", cx.ws.target_dir.as_str()]).args(&package_args);
     cargo::clean_args(cx, &mut cmd);
-    if let Err(e) = if cx.args.verbose > 1 { cmd.run() } else { cmd.run_with_output() } {
+    if let Err(e) = if cx.build.verbose > 1 { cmd.run() } else { cmd.run_with_output() } {
         warn!("{:#}", e);
     }
 

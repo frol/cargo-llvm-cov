@@ -26,18 +26,21 @@ use std::{
     collections::HashMap,
     convert::TryInto,
     ffi::{OsStr, OsString},
+    slice,
 };
 
 use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Clap;
+use cli::RunOptions;
 use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::{
-    cli::{Coloring, Opts, Subcommand},
+    cli::{Args, Coloring, Opts, Subcommand},
     config::StringOrArray,
     context::Context,
+    process::ProcessBuilder,
 };
 
 fn main() {
@@ -48,7 +51,7 @@ fn main() {
 }
 
 fn try_main() -> Result<()> {
-    let Opts::LlvmCov(args) = Opts::parse();
+    let Opts::LlvmCov(mut args) = Opts::parse();
 
     match args.subcommand {
         Some(Subcommand::Demangle) => {
@@ -59,19 +62,60 @@ fn try_main() -> Result<()> {
             clean::run(options)?;
         }
 
-        None => {
-            term::set_quiet(args.quiet);
-            let cx = &Context::new(args)?;
+        Some(Subcommand::Run(mut options)) => {
+            term::set_quiet(options.quiet);
+
+            let cx = &Context::new(
+                options.build(),
+                options.cov(),
+                false,
+                &[],
+                options.package.as_ref().map(slice::from_ref).unwrap_or_default(),
+                options.quiet,
+                false,
+                false,
+            )?;
 
             clean::clean_partial(cx)?;
             create_dirs(cx)?;
-            match (cx.args.no_run, cx.args.no_report) {
+
+            run_run(cx, &options)?;
+
+            if !cx.cov.no_report {
+                generate_report(cx)?;
+            }
+        }
+
+        None => {
+            term::set_quiet(args.quiet);
+            if args.doctests {
+                warn!("--doctests option is unstable");
+            }
+            if args.doc {
+                args.doctests = true;
+                warn!("--doc option is unstable");
+            }
+
+            let cx = &Context::new(
+                args.build(),
+                args.cov(),
+                args.workspace,
+                &args.exclude,
+                &args.package,
+                args.quiet,
+                args.doctests,
+                args.no_run,
+            )?;
+
+            clean::clean_partial(cx)?;
+            create_dirs(cx)?;
+            match (args.no_run, cx.cov.no_report) {
                 (false, false) => {
-                    run_test(cx)?;
+                    run_test(cx, &args)?;
                     generate_report(cx)?;
                 }
                 (false, true) => {
-                    run_test(cx)?;
+                    run_test(cx, &args)?;
                 }
                 (true, false) => {
                     generate_report(cx)?;
@@ -86,65 +130,85 @@ fn try_main() -> Result<()> {
 fn create_dirs(cx: &Context) -> Result<()> {
     fs::create_dir_all(&cx.ws.target_dir)?;
 
-    if let Some(output_dir) = &cx.args.output_dir {
+    if let Some(output_dir) = &cx.cov.output_dir {
         fs::create_dir_all(output_dir)?;
-        if cx.args.html {
+        if cx.cov.html {
             fs::create_dir_all(output_dir.join("html"))?;
         }
-        if cx.args.text {
+        if cx.cov.text {
             fs::create_dir_all(output_dir.join("text"))?;
         }
     }
 
-    if cx.args.doctests {
+    if cx.doctests {
         fs::create_dir_all(&cx.ws.doctests_dir)?;
     }
     Ok(())
 }
 
-fn run_test(cx: &Context) -> Result<()> {
+fn set_env(cx: &Context, cmd: &mut ProcessBuilder) {
     let llvm_profile_file = cx.ws.target_dir.join(format!("{}-%m.profraw", cx.ws.package_name));
 
     let rustflags = &mut cx.env.rustflags.clone().unwrap_or_default();
     rustflags.push(" -Z instrument-coverage");
-    if !cx.args.no_cfg_coverage {
+    if !cx.cov.no_cfg_coverage {
         rustflags.push(" --cfg coverage");
     }
     // --remap-path-prefix is needed because sometimes macros are displayed with absolute path
     rustflags.push(format!(" --remap-path-prefix {}/=", cx.ws.metadata.workspace_root));
-    if cx.args.target.is_none() {
+    if cx.build.target.is_none() {
         rustflags.push(" --cfg trybuild_no_target");
     }
 
     // https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/instrument-coverage.html#including-doc-tests
     let rustdocflags = &mut cx.env.rustdocflags.clone();
-    if cx.args.doctests {
+    if cx.doctests {
         let rustdocflags = rustdocflags.get_or_insert_with(OsString::new);
         rustdocflags.push(format!(
             " -Z instrument-coverage -Z unstable-options --persist-doctests {}",
             cx.ws.doctests_dir
         ));
-        if !cx.args.no_cfg_coverage {
+        if !cx.cov.no_cfg_coverage {
             rustdocflags.push(" --cfg coverage");
         }
     }
 
-    let mut cargo = cx.cargo_process();
-    cargo.env("RUSTFLAGS", &rustflags);
+    cmd.env("RUSTFLAGS", &rustflags);
     if let Some(rustdocflags) = rustdocflags {
-        cargo.env("RUSTDOCFLAGS", &rustdocflags);
+        cmd.env("RUSTDOCFLAGS", &rustdocflags);
     }
-    cargo.env("LLVM_PROFILE_FILE", &*llvm_profile_file);
-    cargo.env("CARGO_INCREMENTAL", "0");
-    cargo.env("CARGO_TARGET_DIR", &cx.ws.target_dir);
+    cmd.env("LLVM_PROFILE_FILE", &*llvm_profile_file);
+    cmd.env("CARGO_INCREMENTAL", "0");
+    cmd.env("CARGO_TARGET_DIR", &cx.ws.target_dir);
+}
+
+fn run_test(cx: &Context, args: &Args) -> Result<()> {
+    let mut cargo = cx.cargo_process();
+
+    set_env(cx, &mut cargo);
 
     cargo.arg("test");
-    if cx.args.doctests && !cx.args.unstable_flags.iter().any(|f| f == "doctest-in-workspace") {
+    if cx.doctests && !cx.build.unstable_flags.iter().any(|f| f == "doctest-in-workspace") {
         // https://github.com/rust-lang/cargo/issues/9427
         cargo.arg("-Z");
         cargo.arg("doctest-in-workspace");
     }
-    cargo::test_args(cx, &mut cargo);
+    cargo::test_args(cx, args, &mut cargo);
+
+    if cx.verbose {
+        status!("Running", "{}", cargo);
+    }
+    cargo.stdout_to_stderr().run()?;
+    Ok(())
+}
+
+fn run_run(cx: &Context, options: &RunOptions) -> Result<()> {
+    let mut cargo = cx.cargo_process();
+
+    set_env(cx, &mut cargo);
+
+    cargo.arg("run");
+    cargo::run_args(cx, options, &mut cargo);
 
     if cx.verbose {
         status!("Running", "{}", cargo);
@@ -164,8 +228,8 @@ fn generate_report(cx: &Context) -> Result<()> {
             .context("failed to generate report")?;
     }
 
-    if cx.args.open {
-        let path = &cx.args.output_dir.as_ref().unwrap().join("html/index.html");
+    if cx.cov.open {
+        let path = &cx.cov.output_dir.as_ref().unwrap().join("html/index.html");
         status!("Opening", "{}", path);
         open_report(cx, path)?;
     }
@@ -207,7 +271,7 @@ fn merge_profraw(cx: &Context) -> Result<()> {
         )
         .arg("-o")
         .arg(&cx.ws.profdata_file);
-    if let Some(jobs) = cx.args.jobs {
+    if let Some(jobs) = cx.build.jobs {
         cmd.arg(format!("-num-threads={}", jobs));
     }
     if let Some(flags) = &cx.env.cargo_llvm_profdata_flags {
@@ -243,17 +307,17 @@ fn object_files(cx: &Context) -> Result<Vec<OsString>> {
     // https://doc.rust-lang.org/nightly/unstable-book/compiler-flags/instrument-coverage.html#tips-for-listing-the-binaries-automatically
     let mut target_dir = cx.ws.target_dir.clone();
     // https://doc.rust-lang.org/nightly/cargo/guide/build-cache.html
-    if let Some(target) = &cx.args.target {
+    if let Some(target) = &cx.build.target {
         target_dir.push(target);
     }
-    target_dir.push(if cx.args.release { "release" } else { "debug" });
+    target_dir.push(if cx.build.release { "release" } else { "debug" });
     for f in walk_target_dir(&target_dir) {
         let f = f.path();
         if is_executable::is_executable(&f) {
             files.push(f.to_owned().into_os_string());
         }
     }
-    if cx.args.doctests {
+    if cx.doctests {
         for f in glob::glob(cx.ws.doctests_dir.join("*/rust_out").as_str())?.filter_map(Result::ok)
         {
             if is_executable::is_executable(&f) {
@@ -265,7 +329,7 @@ fn object_files(cx: &Context) -> Result<Vec<OsString>> {
     // trybuild
     let trybuild_dir = &cx.ws.target_dir.join("tests");
     let mut trybuild_target = trybuild_dir.join("target");
-    if let Some(target) = &cx.args.target {
+    if let Some(target) = &cx.build.target {
         trybuild_target.push(target);
     }
     // Currently, trybuild always use debug build.
@@ -337,13 +401,13 @@ enum Format {
 
 impl Format {
     fn from_args(cx: &Context) -> Vec<Self> {
-        if cx.args.json {
+        if cx.cov.json {
             vec![Self::Json]
-        } else if cx.args.lcov {
+        } else if cx.cov.lcov {
             vec![Self::LCov]
-        } else if cx.args.text {
+        } else if cx.cov.text {
             vec![Self::Text]
-        } else if cx.args.html {
+        } else if cx.cov.html {
             vec![Self::Html]
         } else {
             vec![Self::None]
@@ -366,10 +430,10 @@ impl Format {
             // https://llvm.org/docs/CommandGuide/llvm-cov.html#llvm-cov-export
             return None;
         }
-        if self == Self::Text && cx.args.output_dir.is_some() {
+        if self == Self::Text && cx.cov.output_dir.is_some() {
             return Some("-use-color=0");
         }
-        match cx.args.color {
+        match cx.build.color {
             Some(Coloring::Auto) | None => None,
             Some(Coloring::Always) => Some("-use-color=1"),
             Some(Coloring::Never) => Some("-use-color=0"),
@@ -388,7 +452,7 @@ impl Format {
         cmd.args(self.use_color(cx));
         cmd.arg(format!("-instr-profile={}", cx.ws.profdata_file));
         cmd.args(object_files.iter().flat_map(|f| [OsStr::new("-object"), f]));
-        if let Some(jobs) = cx.args.jobs {
+        if let Some(jobs) = cx.build.jobs {
             cmd.arg(format!("-num-threads={}", jobs));
         }
         if let Some(ignore_filename_regex) = ignore_filename_regex {
@@ -399,14 +463,14 @@ impl Format {
         match self {
             Self::Text | Self::Html => {
                 cmd.args([
-                    &format!("-show-instantiations={}", !cx.args.hide_instantiations),
+                    &format!("-show-instantiations={}", !cx.cov.hide_instantiations),
                     "-show-line-counts-or-regions",
                     "-show-expansions",
                     &format!("-Xdemangler={}", cx.env.current_exe.display()),
                     "-Xdemangler=llvm-cov",
                     "-Xdemangler=demangle",
                 ]);
-                if let Some(output_dir) = &cx.args.output_dir {
+                if let Some(output_dir) = &cx.cov.output_dir {
                     if self == Self::Html {
                         cmd.arg(&format!("-output-dir={}", output_dir.join("html")));
                     } else {
@@ -415,7 +479,7 @@ impl Format {
                 }
             }
             Self::Json | Self::LCov => {
-                if cx.args.summary_only {
+                if cx.cov.summary_only {
                     cmd.arg("-summary-only");
                 }
             }
@@ -426,12 +490,13 @@ impl Format {
             cmd.args(flags.split(' ').filter(|s| !s.trim().is_empty()));
         }
 
-        if let Some(output_path) = &cx.args.output_path {
+        if let Some(output_path) = &cx.cov.output_path {
             if cx.verbose {
                 status!("Running", "{}", cmd);
             }
             let out = cmd.read()?;
             fs::write(output_path, out)?;
+            eprintln!();
             status!("Finished", "report saved to {}", output_path);
             return Ok(());
         }
@@ -441,7 +506,8 @@ impl Format {
         }
         cmd.run()?;
         if matches!(self, Self::Html | Self::Text) {
-            if let Some(output_dir) = &cx.args.output_dir {
+            if let Some(output_dir) = &cx.cov.output_dir {
+                eprintln!();
                 if self == Self::Html {
                     status!("Finished", "report saved to {}", output_dir.join("html"));
                 } else {
@@ -482,13 +548,13 @@ fn ignore_filename_regex(cx: &Context) -> Option<String> {
 
     let mut out = Out::default();
 
-    if cx.args.disable_default_ignore_filename_regex {
-        if let Some(ignore_filename) = &cx.args.ignore_filename_regex {
+    if cx.cov.disable_default_ignore_filename_regex {
+        if let Some(ignore_filename) = &cx.cov.ignore_filename_regex {
             out.push(ignore_filename);
         }
     } else {
         out.push(default_ignore_filename_regex());
-        if let Some(ignore) = &cx.args.ignore_filename_regex {
+        if let Some(ignore) = &cx.cov.ignore_filename_regex {
             out.push(ignore);
         }
         if let Some(home) = home::home_dir() {
